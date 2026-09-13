@@ -36,13 +36,13 @@ export class HttpApiGateway extends Construct {
     this.api = new apigwv2.CfnApi(this, 'Api', props.openApiBody
       ? { body: props.openApiBody }
       : {
-          name: contextId(props.context),
-          protocolType: 'HTTP',
-          description: props.description,
-          disableExecuteApiEndpoint: props.disableExecuteApiEndpoint ?? true,
-          version: props.apiVersion,
-          corsConfiguration: corsConfigProperty(props.corsConfiguration),
-        },
+        name: contextId(props.context),
+        protocolType: 'HTTP',
+        description: props.description,
+        disableExecuteApiEndpoint: props.disableExecuteApiEndpoint ?? true,
+        version: props.apiVersion,
+        corsConfiguration: corsConfigProperty(props.corsConfiguration),
+      },
     );
 
     // Default stage
@@ -81,7 +81,9 @@ export class HttpApiGateway extends Construct {
       });
     });
 
-    // Integrations and routes — skipped when openApiBody is provided (spec defines them)
+    // Integrations, authorizers, and routes — skipped when openApiBody is provided
+    // (the spec defines all three; attach authorizers there via
+    // x-amazon-apigateway-authorizer instead)
     if (!props.openApiBody) {
       const integrationMap: Record<string, apigwv2.CfnIntegration> = {};
       Object.entries(props.integrations ?? {}).forEach(([key, intCfg]) => {
@@ -96,14 +98,58 @@ export class HttpApiGateway extends Construct {
         integrationMap[key] = new apigwv2.CfnIntegration(this, `Integration-${key}`, integrationProps);
       });
 
+      // Authorizers — referenced by route.authorizerKey below. `type` drives both
+      // the AWS::ApiGatewayV2::Authorizer shape and the route's AuthorizationType
+      // ('LAMBDA' authorizers are CFN AuthorizerType REQUEST / route type CUSTOM).
+      const authorizerMap: Record<string, { ref?: string; authorizationType: string }> = {};
+      Object.entries(props.authorizers ?? {}).forEach(([key, authCfg]) => {
+        if (authCfg.type === 'JWT') {
+          const authorizer = new apigwv2.CfnAuthorizer(this, `Authorizer-${key}`, {
+            apiId: this.api!.ref,
+            name: `${contextId(props.context)}-${key}`,
+            authorizerType: 'JWT',
+            identitySource: authCfg.identitySources ?? ['$request.header.Authorization'],
+            jwtConfiguration: {
+              audience: authCfg.jwtAudience,
+              issuer: authCfg.jwtIssuer,
+            },
+          });
+          authorizerMap[key] = { ref: authorizer.ref, authorizationType: 'JWT' };
+        } else if (authCfg.type === 'LAMBDA') {
+          const authorizer = new apigwv2.CfnAuthorizer(this, `Authorizer-${key}`, {
+            apiId: this.api!.ref,
+            name: `${contextId(props.context)}-${key}`,
+            authorizerType: 'REQUEST',
+            authorizerUri: authCfg.lambdaArn,
+            authorizerPayloadFormatVersion: '2.0',
+            identitySource: authCfg.identitySources ?? ['$request.header.Authorization'],
+          });
+          authorizerMap[key] = { ref: authorizer.ref, authorizationType: 'CUSTOM' };
+        } else if (authCfg.type === 'NONE') {
+          authorizerMap[key] = { authorizationType: 'NONE' };
+        }
+      });
+
       Object.entries(props.routes ?? {}).forEach(([key, routeCfg]) => {
         const integration = integrationMap[routeCfg.integrationKey];
         if (!integration) return;
+        let authorizer: { ref?: string; authorizationType: string } | undefined;
+        if (routeCfg.authorizerKey) {
+          authorizer = authorizerMap[routeCfg.authorizerKey];
+          if (!authorizer) {
+            throw new Error(
+              `HttpApiGateway: route "${key}" references authorizerKey "${routeCfg.authorizerKey}", ` +
+              'which has no corresponding entry in `authorizers` (or its type is unrecognized).',
+            );
+          }
+        }
         new apigwv2.CfnRoute(this, `Route-${key}`, {
           apiId: this.api!.ref,
           routeKey: routeCfg.routeKey,
           target: Fn.join('', ['integrations/', integration.ref]),
           operationName: routeCfg.operationName,
+          authorizationType: authorizer?.authorizationType,
+          authorizerId: authorizer?.ref,
         });
       });
     }
