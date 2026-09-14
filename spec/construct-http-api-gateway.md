@@ -178,6 +178,15 @@ export const defaultAccessLogFormat = (): string =>
 
 ## Construct Class (`src/http-api-gateway.ts`)
 
+> **Note:** the shipped implementation has diverged from the L2-based pseudocode below —
+> it builds the API, integrations, authorizers, and routes with L1 (`Cfn*`) resources
+> throughout, and additionally supports an `openApiBody` prop (a pre-parsed OpenAPI spec)
+> that sources routes/integrations/authorizers from the spec instead, skipping this
+> section's Integrations/Authorizers/Routes blocks entirely. The authorizer *shape* below
+> (per-`type` switch with a `default: throw`, required-field checks, and
+> `authorizerKey` → `AuthorizerId`/`AuthorizationType` on the route) is what must be
+> preserved regardless of L1 vs L2 — see the real source for the exact CFN properties.
+
 ```typescript
 export class HttpApiGateway extends Construct {
   public readonly api?: apigwv2.HttpApi;
@@ -240,14 +249,61 @@ export class HttpApiGateway extends Construct {
       }
     });
 
+    // Authorizers — referenced by route.authorizerKey below. A misspelled/unrecognized
+    // `type` must fail synthesis, not silently produce no authorizer (the exact bug this
+    // section exists to prevent from being reintroduced on regeneration).
+    const authorizerMap: Record<string, apigwv2.IHttpRouteAuthorizer> = {};
+    Object.entries(props.authorizers ?? {}).forEach(([key, authCfg]) => {
+      switch (authCfg.type) {
+        case 'JWT':
+          if (!authCfg.jwtIssuer || !authCfg.jwtAudience?.length) {
+            throw new Error(`HttpApiGateway: authorizer "${key}" has type 'JWT' but is missing jwtIssuer and/or jwtAudience.`);
+          }
+          authorizerMap[key] = new authorizers.HttpJwtAuthorizer(`Authorizer-${key}`, authCfg.jwtIssuer, {
+            jwtAudience: authCfg.jwtAudience,
+            identitySource: authCfg.identitySources,
+          });
+          break;
+        case 'LAMBDA': {
+          if (!authCfg.lambdaArn) {
+            throw new Error(`HttpApiGateway: authorizer "${key}" has type 'LAMBDA' but is missing lambdaArn.`);
+          }
+          const fn = lambda.Function.fromFunctionArn(this, `AuthorizerFn-${key}`, authCfg.lambdaArn);
+          authorizerMap[key] = new authorizers.HttpLambdaAuthorizer(`Authorizer-${key}`, fn, {
+            identitySource: authCfg.identitySources,
+            responseTypes: [authorizers.HttpLambdaResponseType.SIMPLE],
+          });
+          break;
+        }
+        case 'NONE':
+          // No authorizer resource — a route referencing this key explicitly opts out
+          // of any authorizer inherited elsewhere. Handled in the Routes loop below.
+          break;
+        default:
+          throw new Error(`HttpApiGateway: authorizer "${key}" has unrecognized type "${authCfg.type}" (expected 'JWT', 'LAMBDA', or 'NONE').`);
+      }
+    });
+
     // Routes
-    Object.entries(props.routes ?? {}).forEach(([, routeCfg]) => {
+    Object.entries(props.routes ?? {}).forEach(([key, routeCfg]) => {
       const integration = integrationMap[routeCfg.integrationKey];
       if (!integration) return;
+      let authorizer: apigwv2.IHttpRouteAuthorizer | undefined;
+      if (routeCfg.authorizerKey) {
+        authorizer = authorizerMap[routeCfg.authorizerKey];
+        const isExplicitNone = props.authorizers?.[routeCfg.authorizerKey]?.type === 'NONE';
+        if (!authorizer && !isExplicitNone) {
+          throw new Error(
+            `HttpApiGateway: route "${key}" references authorizerKey "${routeCfg.authorizerKey}", ` +
+            'which has no corresponding entry in `authorizers`.'
+          );
+        }
+      }
       this.api!.addRoutes({
         path:        routeCfg.routeKey.split(' ')[1] ?? '/',
         methods:     [mapHttpMethod(routeCfg.routeKey.split(' ')[0])],
         integration,
+        authorizer,
       });
     });
 
@@ -363,6 +419,49 @@ const mapHttpMethod = (m: string): apigwv2.HttpMethod => {
 - **When** an `HttpApiGateway` is created
 - **Then** no `AWS::ApiGatewayV2::Api` resources exist in the stack
 
+### Feature: Authorizers
+
+**Scenario: JWT authorizer attached to a route**
+- **Given** an `authorizers` entry with `type: 'JWT'`, `jwtIssuer`, and `jwtAudience`
+- **And** a route referencing it via `authorizerKey`
+- **When** an `HttpApiGateway` is created
+- **Then** an `AWS::ApiGatewayV2::Authorizer` resource exists with `AuthorizerType: JWT`
+- **And** the route has `AuthorizationType: JWT` and a matching `AuthorizerId`
+
+**Scenario: LAMBDA authorizer attached to a route**
+- **Given** an `authorizers` entry with `type: 'LAMBDA'` and `lambdaArn`
+- **And** a route referencing it via `authorizerKey`
+- **When** an `HttpApiGateway` is created
+- **Then** an `AWS::ApiGatewayV2::Authorizer` resource exists with `AuthorizerType: REQUEST`
+- **And** the route has `AuthorizationType: CUSTOM` and a matching `AuthorizerId`
+
+**Scenario: NONE authorizer explicitly disables auth on a route**
+- **Given** an `authorizers` entry with `type: 'NONE'`
+- **And** a route referencing it via `authorizerKey`
+- **When** an `HttpApiGateway` is created
+- **Then** no `AWS::ApiGatewayV2::Authorizer` resource is created for that entry
+- **And** the route has `AuthorizationType: NONE`
+
+**Scenario: Unrecognized authorizer type fails synthesis**
+- **Given** an `authorizers` entry with an unrecognized `type` (e.g. `'Jwt'`)
+- **When** an `HttpApiGateway` is created
+- **Then** construction throws, rather than silently producing no authorizer
+
+**Scenario: Missing required fields fail synthesis**
+- **Given** a `'JWT'` authorizer missing `jwtIssuer` or `jwtAudience`, or a `'LAMBDA'` authorizer missing `lambdaArn`
+- **When** an `HttpApiGateway` is created
+- **Then** construction throws
+
+**Scenario: Unresolved authorizerKey fails synthesis**
+- **Given** a route with an `authorizerKey` not present in `authorizers`
+- **When** an `HttpApiGateway` is created
+- **Then** construction throws, rather than silently creating an unauthenticated route
+
+**Scenario: Authorizers ignored when openApiBody is provided**
+- **Given** `openApiBody` is set, and `authorizers` is also provided
+- **When** an `HttpApiGateway` is created
+- **Then** no `AWS::ApiGatewayV2::Authorizer` resource is created — attach authorizers inside the spec via `x-amazon-apigateway-authorizer` instead
+
 ## README
 
 Generate a `README.md` following the template in [`spec/AGENT-CONTEXT.md`](./AGENT-CONTEXT.md#readme-generation-requirement).
@@ -373,6 +472,7 @@ The Mermaid diagram should show:
 flowchart LR
     A[Client] -->|HTTPS| B[API Gateway v2 HTTP API]
     B --> C[Routes]
+    J[Authorizer] -->|JWT or Lambda| C
     C -->|AWS_PROXY| D[Lambda Function]
     C -->|HTTP_PROXY| E[HTTP Backend]
     B --> F[Custom Domain]

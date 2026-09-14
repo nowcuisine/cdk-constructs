@@ -360,4 +360,276 @@ describe('HttpApiGateway construct', () => {
       }),
     });
   });
+
+  describe('authorizers', () => {
+    test('attaches a JWT authorizer to its route', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      new HttpApiGateway(stack, 'SUT', {
+        context,
+        integrations: {
+          api: { type: 'AWS_PROXY', uri: 'arn:aws:lambda:us-east-1:123456789012:function:my-fn' },
+        },
+        authorizers: {
+          cognito: {
+            type: 'JWT',
+            jwtIssuer: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc123',
+            jwtAudience: ['client-id-123'],
+          },
+        },
+        routes: {
+          getAdminUsers: {
+            routeKey: 'GET /admin/users',
+            integrationKey: 'api',
+            authorizerKey: 'cognito',
+          },
+        },
+      });
+      const template = Template.fromStack(stack);
+      template.hasResourceProperties('AWS::ApiGatewayV2::Authorizer', {
+        AuthorizerType: 'JWT',
+        IdentitySource: ['$request.header.Authorization'],
+        JwtConfiguration: {
+          Audience: ['client-id-123'],
+          Issuer: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc123',
+        },
+      });
+      const authorizers = template.findResources('AWS::ApiGatewayV2::Authorizer');
+      const authorizerLogicalId = Object.keys(authorizers)[0];
+      template.hasResourceProperties('AWS::ApiGatewayV2::Route', {
+        RouteKey: 'GET /admin/users',
+        AuthorizationType: 'JWT',
+        AuthorizerId: { Ref: authorizerLogicalId },
+      });
+    });
+
+    test('honors custom identitySources on a JWT authorizer', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      new HttpApiGateway(stack, 'SUT', {
+        context,
+        integrations: {
+          api: { type: 'AWS_PROXY', uri: 'arn:aws:lambda:us-east-1:123456789012:function:my-fn' },
+        },
+        authorizers: {
+          cognito: {
+            type: 'JWT',
+            jwtIssuer: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc123',
+            jwtAudience: ['client-id-123'],
+            identitySources: ['$request.header.x-custom-auth'],
+          },
+        },
+        routes: {
+          getAdminUsers: {
+            routeKey: 'GET /admin/users',
+            integrationKey: 'api',
+            authorizerKey: 'cognito',
+          },
+        },
+      });
+      const template = Template.fromStack(stack);
+      template.hasResourceProperties('AWS::ApiGatewayV2::Authorizer', {
+        IdentitySource: ['$request.header.x-custom-auth'],
+      });
+    });
+
+    test('attaches a LAMBDA (REQUEST) authorizer to its route', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      new HttpApiGateway(stack, 'SUT', {
+        context,
+        integrations: {
+          api: { type: 'AWS_PROXY', uri: 'arn:aws:lambda:us-east-1:123456789012:function:my-fn' },
+        },
+        authorizers: {
+          custom: {
+            type: 'LAMBDA',
+            lambdaArn: 'arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:my-authorizer/invocations',
+          },
+        },
+        routes: {
+          getAdminUsers: {
+            routeKey: 'GET /admin/users',
+            integrationKey: 'api',
+            authorizerKey: 'custom',
+          },
+        },
+      });
+      const template = Template.fromStack(stack);
+      template.hasResourceProperties('AWS::ApiGatewayV2::Authorizer', {
+        AuthorizerType: 'REQUEST',
+        AuthorizerUri: 'arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:my-authorizer/invocations',
+        AuthorizerPayloadFormatVersion: '2.0',
+        IdentitySource: ['$request.header.Authorization'],
+      });
+      const authorizers = template.findResources('AWS::ApiGatewayV2::Authorizer');
+      const authorizerLogicalId = Object.keys(authorizers)[0];
+      template.hasResourceProperties('AWS::ApiGatewayV2::Route', {
+        RouteKey: 'GET /admin/users',
+        AuthorizationType: 'CUSTOM',
+        AuthorizerId: { Ref: authorizerLogicalId },
+      });
+    });
+
+    test('a NONE authorizer explicitly sets AuthorizationType NONE with no AuthorizerId', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      new HttpApiGateway(stack, 'SUT', {
+        context,
+        integrations: {
+          api: { type: 'AWS_PROXY', uri: 'arn:aws:lambda:us-east-1:123456789012:function:my-fn' },
+        },
+        authorizers: {
+          open: { type: 'NONE' },
+        },
+        routes: {
+          getHealth: {
+            routeKey: 'GET /health',
+            integrationKey: 'api',
+            authorizerKey: 'open',
+          },
+        },
+      });
+      const template = Template.fromStack(stack);
+      expect(template.findResources('AWS::ApiGatewayV2::Authorizer')).toEqual({});
+      template.hasResourceProperties('AWS::ApiGatewayV2::Route', {
+        RouteKey: 'GET /health',
+        AuthorizationType: 'NONE',
+      });
+    });
+
+    test('a route without authorizerKey has no AuthorizationType/AuthorizerId set', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      new HttpApiGateway(stack, 'SUT', {
+        context,
+        integrations: {
+          api: { type: 'AWS_PROXY', uri: 'arn:aws:lambda:us-east-1:123456789012:function:my-fn' },
+        },
+        routes: {
+          getMenu: { routeKey: 'GET /menu', integrationKey: 'api' },
+        },
+      });
+      const template = Template.fromStack(stack);
+      const route = Object.values(template.findResources('AWS::ApiGatewayV2::Route'))[0];
+      expect(route.Properties.AuthorizationType).toBeUndefined();
+      expect(route.Properties.AuthorizerId).toBeUndefined();
+    });
+
+    test('throws when a route references an unknown authorizerKey', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      expect(() => new HttpApiGateway(stack, 'SUT', {
+        context,
+        integrations: {
+          api: { type: 'AWS_PROXY', uri: 'arn:aws:lambda:us-east-1:123456789012:function:my-fn' },
+        },
+        routes: {
+          getAdminUsers: {
+            routeKey: 'GET /admin/users',
+            integrationKey: 'api',
+            authorizerKey: 'nonexistent',
+          },
+        },
+      })).toThrow(/authorizerKey "nonexistent"/);
+    });
+
+    test('throws on an unrecognized authorizer type instead of silently creating nothing', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      expect(() => new HttpApiGateway(stack, 'SUT', {
+        context,
+        integrations: {
+          api: { type: 'AWS_PROXY', uri: 'arn:aws:lambda:us-east-1:123456789012:function:my-fn' },
+        },
+        authorizers: {
+          // `as any` simulates the value a non-TypeScript JSII consumer (or a
+          // config file) could still pass at runtime despite the literal union type.
+          cognito: { type: 'Jwt' } as any,
+        },
+        routes: {
+          getAdminUsers: {
+            routeKey: 'GET /admin/users',
+            integrationKey: 'api',
+            authorizerKey: 'cognito',
+          },
+        },
+      })).toThrow(/authorizer "cognito" has unrecognized type "Jwt"/);
+    });
+
+    test('throws when a JWT authorizer is missing jwtIssuer/jwtAudience', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      expect(() => new HttpApiGateway(stack, 'SUT', {
+        context,
+        authorizers: {
+          cognito: { type: 'JWT' },
+        },
+      })).toThrow(/authorizer "cognito" has type 'JWT' but is missing jwtIssuer and\/or jwtAudience/);
+    });
+
+    test('throws when a JWT authorizer has an empty jwtAudience', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      expect(() => new HttpApiGateway(stack, 'SUT', {
+        context,
+        authorizers: {
+          cognito: {
+            type: 'JWT',
+            jwtIssuer: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc123',
+            jwtAudience: [],
+          },
+        },
+      })).toThrow(/authorizer "cognito" has type 'JWT'/);
+    });
+
+    test('throws when a LAMBDA authorizer is missing lambdaArn', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      expect(() => new HttpApiGateway(stack, 'SUT', {
+        context,
+        authorizers: {
+          custom: { type: 'LAMBDA' },
+        },
+      })).toThrow(/authorizer "custom" has type 'LAMBDA' but is missing lambdaArn/);
+    });
+
+    test('falls back to the default identitySource when identitySources is an empty array', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      new HttpApiGateway(stack, 'SUT', {
+        context,
+        authorizers: {
+          cognito: {
+            type: 'JWT',
+            jwtIssuer: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc123',
+            jwtAudience: ['client-id-123'],
+            identitySources: [],
+          },
+        },
+      });
+      const template = Template.fromStack(stack);
+      template.hasResourceProperties('AWS::ApiGatewayV2::Authorizer', {
+        IdentitySource: ['$request.header.Authorization'],
+      });
+    });
+
+    test('authorizers are not created when openApiBody is provided', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      new HttpApiGateway(stack, 'SUT', {
+        context,
+        openApiBody: { openapi: '3.0.1', info: { title: 'Test API', version: '1.0' }, paths: {} },
+        authorizers: {
+          cognito: {
+            type: 'JWT',
+            jwtIssuer: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc123',
+            jwtAudience: ['client-id-123'],
+          },
+        },
+      });
+      const template = Template.fromStack(stack);
+      expect(template.findResources('AWS::ApiGatewayV2::Authorizer')).toEqual({});
+    });
+  });
 });

@@ -11,6 +11,8 @@ import { Construct } from 'constructs';
 import { corsConfigProperty, defaultAccessLogFormat } from './http-api-gateway-fns';
 import { HttpApiGatewayProps } from './http-api-gateway-types';
 
+const DEFAULT_AUTHORIZER_IDENTITY_SOURCE = ['$request.header.Authorization'];
+
 export class HttpApiGateway extends Construct {
   public readonly api?: apigwv2.CfnApi;
   public readonly logGroup?: logs.LogGroup;
@@ -81,7 +83,9 @@ export class HttpApiGateway extends Construct {
       });
     });
 
-    // Integrations and routes — skipped when openApiBody is provided (spec defines them)
+    // Integrations, authorizers, and routes — skipped when openApiBody is provided
+    // (the spec defines all three; attach authorizers there via
+    // x-amazon-apigateway-authorizer instead)
     if (!props.openApiBody) {
       const integrationMap: Record<string, apigwv2.CfnIntegration> = {};
       Object.entries(props.integrations ?? {}).forEach(([key, intCfg]) => {
@@ -96,14 +100,89 @@ export class HttpApiGateway extends Construct {
         integrationMap[key] = new apigwv2.CfnIntegration(this, `Integration-${key}`, integrationProps);
       });
 
+      // Authorizers — referenced by route.authorizerKey below. `type` drives both
+      // the AWS::ApiGatewayV2::Authorizer shape and the route's AuthorizationType
+      // ('LAMBDA' authorizers are CFN AuthorizerType REQUEST / route type CUSTOM).
+      // An unrecognized type fails synthesis rather than silently producing no
+      // authorizer — the same failure mode this ticket exists to eliminate for
+      // routes, just one level up.
+      const authorizerMap: Record<string, { ref?: string; authorizationType: string }> = {};
+      Object.entries(props.authorizers ?? {}).forEach(([key, authCfg]) => {
+        const name = `${contextId(props.context)}-${key}`;
+        const identitySource = authCfg.identitySources?.length
+          ? authCfg.identitySources
+          : DEFAULT_AUTHORIZER_IDENTITY_SOURCE;
+
+        switch (authCfg.type) {
+          case 'JWT': {
+            if (!authCfg.jwtIssuer || !authCfg.jwtAudience?.length) {
+              throw new Error(
+                `HttpApiGateway: authorizer "${key}" has type 'JWT' but is missing jwtIssuer and/or jwtAudience.`,
+              );
+            }
+            const authorizer = new apigwv2.CfnAuthorizer(this, `Authorizer-${key}`, {
+              apiId: this.api!.ref,
+              name,
+              authorizerType: 'JWT',
+              identitySource,
+              jwtConfiguration: {
+                audience: authCfg.jwtAudience,
+                issuer: authCfg.jwtIssuer,
+              },
+            });
+            authorizerMap[key] = { ref: authorizer.ref, authorizationType: 'JWT' };
+            break;
+          }
+          case 'LAMBDA': {
+            if (!authCfg.lambdaArn) {
+              throw new Error(`HttpApiGateway: authorizer "${key}" has type 'LAMBDA' but is missing lambdaArn.`);
+            }
+            const authorizer = new apigwv2.CfnAuthorizer(this, `Authorizer-${key}`, {
+              apiId: this.api!.ref,
+              name,
+              authorizerType: 'REQUEST',
+              authorizerUri: authCfg.lambdaArn,
+              authorizerPayloadFormatVersion: '2.0',
+              identitySource,
+            });
+            authorizerMap[key] = { ref: authorizer.ref, authorizationType: 'CUSTOM' };
+            break;
+          }
+          case 'NONE':
+            authorizerMap[key] = { authorizationType: 'NONE' };
+            break;
+          default:
+            throw new Error(
+              `HttpApiGateway: authorizer "${key}" has unrecognized type "${authCfg.type}" ` +
+              "(expected 'JWT', 'LAMBDA', or 'NONE').",
+            );
+        }
+      });
+
       Object.entries(props.routes ?? {}).forEach(([key, routeCfg]) => {
         const integration = integrationMap[routeCfg.integrationKey];
+        // NOTE: unlike authorizerKey below, an unresolved integrationKey is a silent
+        // no-op (the route just isn't created) rather than a synth-time error. This is
+        // pre-existing behavior for the same "resolve a logical key" pattern, kept
+        // as-is here since correcting it is a separate, unrelated behavior change.
         if (!integration) return;
+        let authorizer: { ref?: string; authorizationType: string } | undefined;
+        if (routeCfg.authorizerKey) {
+          authorizer = authorizerMap[routeCfg.authorizerKey];
+          if (!authorizer) {
+            throw new Error(
+              `HttpApiGateway: route "${key}" references authorizerKey "${routeCfg.authorizerKey}", ` +
+              'which has no corresponding entry in `authorizers`.',
+            );
+          }
+        }
         new apigwv2.CfnRoute(this, `Route-${key}`, {
           apiId: this.api!.ref,
           routeKey: routeCfg.routeKey,
           target: Fn.join('', ['integrations/', integration.ref]),
           operationName: routeCfg.operationName,
+          authorizationType: authorizer?.authorizationType,
+          authorizerId: authorizer?.ref,
         });
       });
     }
