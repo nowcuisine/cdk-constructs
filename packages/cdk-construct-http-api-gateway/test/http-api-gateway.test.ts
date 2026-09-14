@@ -534,6 +534,86 @@ describe('HttpApiGateway construct', () => {
       })).toThrow(/authorizerKey "nonexistent"/);
     });
 
+    test('throws on an unrecognized authorizer type instead of silently creating nothing', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      expect(() => new HttpApiGateway(stack, 'SUT', {
+        context,
+        integrations: {
+          api: { type: 'AWS_PROXY', uri: 'arn:aws:lambda:us-east-1:123456789012:function:my-fn' },
+        },
+        authorizers: {
+          // `as any` simulates the value a non-TypeScript JSII consumer (or a
+          // config file) could still pass at runtime despite the literal union type.
+          cognito: { type: 'Jwt' } as any,
+        },
+        routes: {
+          getAdminUsers: {
+            routeKey: 'GET /admin/users',
+            integrationKey: 'api',
+            authorizerKey: 'cognito',
+          },
+        },
+      })).toThrow(/authorizer "cognito" has unrecognized type "Jwt"/);
+    });
+
+    test('throws when a JWT authorizer is missing jwtIssuer/jwtAudience', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      expect(() => new HttpApiGateway(stack, 'SUT', {
+        context,
+        authorizers: {
+          cognito: { type: 'JWT' },
+        },
+      })).toThrow(/authorizer "cognito" has type 'JWT' but is missing jwtIssuer and\/or jwtAudience/);
+    });
+
+    test('throws when a JWT authorizer has an empty jwtAudience', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      expect(() => new HttpApiGateway(stack, 'SUT', {
+        context,
+        authorizers: {
+          cognito: {
+            type: 'JWT',
+            jwtIssuer: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc123',
+            jwtAudience: [],
+          },
+        },
+      })).toThrow(/authorizer "cognito" has type 'JWT'/);
+    });
+
+    test('throws when a LAMBDA authorizer is missing lambdaArn', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      expect(() => new HttpApiGateway(stack, 'SUT', {
+        context,
+        authorizers: {
+          custom: { type: 'LAMBDA' },
+        },
+      })).toThrow(/authorizer "custom" has type 'LAMBDA' but is missing lambdaArn/);
+    });
+
+    test('falls back to the default identitySource when identitySources is an empty array', () => {
+      const app = new App();
+      const stack = new Stack(app, 'Test');
+      new HttpApiGateway(stack, 'SUT', {
+        context,
+        authorizers: {
+          cognito: {
+            type: 'JWT',
+            jwtIssuer: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc123',
+            jwtAudience: ['client-id-123'],
+            identitySources: [],
+          },
+        },
+      });
+      const template = Template.fromStack(stack);
+      template.hasResourceProperties('AWS::ApiGatewayV2::Authorizer', {
+        IdentitySource: ['$request.header.Authorization'],
+      });
+    });
+
     test('authorizers are not created when openApiBody is provided', () => {
       const app = new App();
       const stack = new Stack(app, 'Test');

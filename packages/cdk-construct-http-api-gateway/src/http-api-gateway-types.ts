@@ -26,8 +26,8 @@ export interface HttpApiIntegration {
 }
 
 export interface HttpApiAuthorizer {
-  /** Authorizer type: 'JWT' | 'LAMBDA' | 'NONE' */
-  readonly type: string;
+  /** Authorizer type. An unrecognized value fails synthesis. */
+  readonly type: 'JWT' | 'LAMBDA' | 'NONE';
   /** JWT issuer URL. Required when `type` is 'JWT'. */
   readonly jwtIssuer?: string;
   /** JWT audience list. Required when `type` is 'JWT'. */

@@ -8,6 +8,7 @@ Provisions an Amazon API Gateway v2 HTTP API with configurable routes, integrati
 flowchart LR
     A[Client] -->|HTTPS| B[API Gateway v2 HTTP API]
     B --> C[Routes]
+    J[Authorizer] -->|JWT or Lambda| C
     C -->|AWS_PROXY| D[Lambda Function]
     C -->|HTTP_PROXY| E[HTTP Backend]
     B --> F[Custom Domain]
@@ -35,6 +36,7 @@ Configure the construct by defining integration targets, route mappings, and opt
 - **AWS::ApiGatewayV2::Stage** - Default stage with optional auto-deploy and stage variables
 - **AWS::ApiGatewayV2::Integration** - Lambda proxy or HTTP proxy integrations
 - **AWS::ApiGatewayV2::Route** - Route definitions mapping HTTP methods and paths to integrations
+- **AWS::ApiGatewayV2::Authorizer** - JWT or Lambda (REQUEST) authorizers attached to routes via `authorizerKey`
 - **AWS::ApiGatewayV2::DomainName** - Custom domain (when dnsName and acmCertificateArn provided)
 - **AWS::ApiGatewayV2::ApiMapping** - Maps the API to the custom domain
 - **AWS::Logs::LogGroup** - CloudWatch access log group (enabled by default)
@@ -83,7 +85,7 @@ See the [examples](./examples) directory for complete usage examples.
 
 - **VPC Links** are created using L1 `CfnVpcLink` with subnet IDs and security group IDs passed directly. No VPC lookup is required.
 - **Route53 alias records** are created as L1 `CfnRecordSet` resources pointing directly to the custom domain's regional endpoint, avoiding zone-name resolution requirements of the L2 `ARecord` construct.
-- **Authorizers** (JWT, Lambda) are defined in the props interface for Terraform parity but integration with routes requires additional wiring in the construct consumer.
+- **Authorizers** (JWT, Lambda) are attached directly to routes: give an `authorizers` entry a logical key and reference it from a route's `authorizerKey`. Only wired up for imperative `routes` — ignored when `openApiBody` is set, since spec-based routes declare their own authorizer via `x-amazon-apigateway-authorizer`. `type: 'NONE'` explicitly sets `AuthorizationType: NONE` on the route with no authorizer resource.
 - **CORS methods** are passed as string values (e.g., `'GET'`, `'POST'`) directly to the CloudFormation `CorsConfiguration` property.
 
 ## Roadmap
@@ -99,8 +101,8 @@ See the [examples](./examples) directory for complete usage examples.
 
 ### v0.2.0
 
-- [ ] JWT authorizer integration with routes
-- [ ] Lambda authorizer integration with routes
+- [x] JWT authorizer integration with routes
+- [x] Lambda authorizer integration with routes
 - [ ] VPC link integration with HTTP integrations
 
 ## License
